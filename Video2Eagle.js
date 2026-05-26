@@ -28,6 +28,10 @@
     /** 脚本版本标识，随请求发送给 Eagle 用于追踪 */
     const SCRIPT_VERSION = "userscript-0.4.1";
 
+    function isInstagramHost(hostname = location.hostname) {
+        return hostname === "instagram.com" || hostname.endsWith(".instagram.com");
+    }
+
     // ============================================================
     // 文本工具函数
     // ============================================================
@@ -253,6 +257,16 @@
         return null;
     }
 
+    function getClosestMediaElement(node) {
+        while (node) {
+            if (node instanceof HTMLImageElement || node instanceof HTMLVideoElement) {
+                return node;
+            }
+            node = node.parentElement;
+        }
+        return null;
+    }
+
     /**
      * 计算元素在视口内的可见区域面积（考虑视口裁剪）。
      * 用于比较多个图片谁在当前屏幕中占据更多空间。
@@ -357,6 +371,124 @@
         return bestImage;
     }
 
+    function resolveInstagramScope(root = document) {
+        if (!(root instanceof Element || root instanceof Document)) {
+            return document;
+        }
+
+        return (
+            root.querySelector('div[role="dialog"] article') ||
+            root.querySelector('div[role="dialog"]') ||
+            root.querySelector("main article") ||
+            root.querySelector("article") ||
+            root
+        );
+    }
+
+    function scoreInstagramMediaCandidate(node, index = 0) {
+        if (!(node instanceof HTMLImageElement || node instanceof HTMLVideoElement)) {
+            return null;
+        }
+
+        const style = window.getComputedStyle(node);
+        if (
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            Number(style.opacity || "1") === 0
+        ) {
+            return null;
+        }
+
+        const rect = node.getBoundingClientRect();
+        const rectArea = rect.width * rect.height;
+        const visibleArea = getVisibleRectArea(rect);
+        if (rect.width < 60 || rect.height < 60 || visibleArea < 2500) {
+            return null;
+        }
+
+        const sourceUrl = node instanceof HTMLVideoElement
+            ? (node.currentSrc || node.src || node.getAttribute("poster") || "")
+            : (node.currentSrc || node.src || "");
+        if (!sourceUrl) {
+            return null;
+        }
+
+        const inHeader = !!node.closest("header");
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const viewportCenterX = window.innerWidth / 2;
+        const viewportCenterY = window.innerHeight / 2;
+        const distanceToCenter = Math.hypot(centerX - viewportCenterX, centerY - viewportCenterY);
+        const sizeBonus = Math.min(rectArea, 500000);
+        const score =
+            visibleArea * 10 +
+            sizeBonus -
+            distanceToCenter * 20 -
+            (inHeader ? 500000 : 0) -
+            index;
+
+        return {
+            node,
+            index,
+            rectArea,
+            visibleArea,
+            sourceUrl,
+            isVideo: node instanceof HTMLVideoElement,
+            score
+        };
+    }
+
+    function findInstagramMediaByPointProbe(root = document) {
+        const scope = resolveInstagramScope(root);
+        const points = [
+            [window.innerWidth / 2, window.innerHeight / 2],
+            [window.innerWidth / 3, window.innerHeight / 2],
+            [window.innerWidth * 2 / 3, window.innerHeight / 2],
+            [window.innerWidth / 2, window.innerHeight / 3],
+            [window.innerWidth / 2, window.innerHeight * 2 / 3]
+        ];
+
+        const candidates = [];
+        for (const [x, y] of points) {
+            const hit = document.elementFromPoint(Math.round(x), Math.round(y));
+            const media = getClosestMediaElement(hit);
+            if (!media || !(scope === document || scope.contains(media))) {
+                continue;
+            }
+            const scored = scoreInstagramMediaCandidate(media, 0);
+            if (scored) {
+                candidates.push(scored);
+            }
+        }
+
+        return candidates.sort((a, b) => b.score - a.score)[0] || null;
+    }
+
+    function pickInstagramCurrentMedia(root = document) {
+        const scope = resolveInstagramScope(root);
+        const nodes = Array.from(scope.querySelectorAll("img, video"));
+        const visibleCandidates = nodes
+            .map((node, index) => scoreInstagramMediaCandidate(node, index))
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score);
+
+        if (visibleCandidates[0]) {
+            return visibleCandidates[0];
+        }
+
+        const probeHit = findInstagramMediaByPointProbe(scope);
+        if (probeHit) {
+            return probeHit;
+        }
+
+        const globalFallback = Array.from(document.querySelectorAll("img, video"))
+            .map((node, index) => scoreInstagramMediaCandidate(node, index))
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score);
+
+        return globalFallback[0] || null;
+    }
+
     /**
      * 综合图片查找策略（核心入口）：
      * 1. 优先从轮播组件中找当前图片
@@ -368,6 +500,11 @@
      * @returns {HTMLImageElement|null}
      */
     function findCurrentVisibleImage() {
+        if (isInstagramHost()) {
+            const media = pickInstagramCurrentMedia();
+            return media && media.node instanceof HTMLImageElement ? media.node : null;
+        }
+
         // === 第一优先级：轮播组件 ===
         const currentCarouselImage = findCurrentCarouselImage() || findCurrentImageInCarouselGroup();
         if (currentCarouselImage) {
@@ -418,29 +555,12 @@
      * @returns {HTMLVideoElement|HTMLImageElement|null}
      */
     function findVisibleMediaElement() {
-        // return findVisibleVideo() || findCurrentVisibleImage();
-        // if (window.location.href.includes("recommend") && document.querySelector(".MbwoSV_H")) {
-          // 推荐页特殊处理：优先找当前视频中的图片（封面或轮播图），因为视频可能是自动播放但用户想保存封面
-          // card 直播，Video是视频和图集
-        //   switch (document.querySelectorAll("div#slidelist div[data-e2e='feed-item'] > div")[1]) {
-        //     case "slider-card":
-        //         return findVisibleVideo() || findCurrentVisibleImage();
-        //     case "sliderVideo":
-        //         return findVisibleVideo() || findCurrentVisibleImage();
-        //     default:
-        //         return findCurrentVisibleImage() || findVisibleVideo();
-        //   }
-        // feed-live 直播 feed-video 视频+图集 feed-active-video 正在播放的视频或图集 data-e2e属性
-        //     if(document.querySelectorAll("div#slidelist div[data-e2e='feed-item'] > div")[0].querySelector("div.MbwoSV_H")){
-        //         // console.log("上个是直播，找图");
-        //         // window.alert("上个是直播，找图");
-        //         return  findCurrentVisibleImage() || findVisibleVideo();
+        if (isInstagramHost()) {
+            return pickInstagramCurrentMedia()?.node || null;
+        }
 
-        //     }
-        // }
-        console.log("$$$$$$常规查找视频或图片");
+        // console.log("$$$$$$常规查找视频或图片");
         return  findVisibleVideo() || findCurrentVisibleImage();
-
     }
 
     // ============================================================
@@ -496,7 +616,10 @@
         // 将视频当前帧绘制到 canvas 上
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        const dataUrl = canvas.toDataURL("image/png");
+        // const dataUrl = canvas.toDataURL("image/png");
+        // 剪裁黑边
+        const dataUrl = autoCropImageFromCanvas(canvas);
+
         if (!dataUrl.startsWith("data:image/png;base64,")) {
             throw new Error("Failed to convert video frame to base64 PNG.");
         }
@@ -537,7 +660,10 @@
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
 
         try {
-            const dataUrl = canvas.toDataURL("image/png");
+            //const dataUrl = canvas.toDataURL("image/png");
+            // 剪裁黑边
+            const dataUrl = autoCropImageFromCanvas(canvas);
+
             if (!dataUrl.startsWith("data:image/png;base64,")) {
                 throw new Error("Failed to convert image to base64 PNG.");
             }
@@ -619,6 +745,44 @@
         };
     }
 
+    function extractInstagramMeta(node) {
+        const article =
+            node?.closest("article") ||
+            document.querySelector('div[role="dialog"] article') ||
+            document.querySelector("main article") ||
+            document.querySelector("article");
+
+        const authorLink = article?.querySelector("header a[href^='/']");
+        const authorName = trimToLength(
+            authorLink?.getAttribute("href")?.replace(/^\/|\/$/g, "").split("/")[0] || "",
+            32
+        );
+        const captionRoot =
+            article?.querySelector("h1") ||
+            article?.querySelector("ul li h1") ||
+            article?.querySelector("article span[dir='auto']");
+        const captionText = extractPlainText(captionRoot);
+        const hashtagTags = unique(
+            (captionText.match(/#[\p{L}\p{N}_]+/gu) || []).map((tag) => tag.slice(1))
+        );
+        const permalink =
+            location.href.match(/^https?:\/\/[^?#]+/)?.[0] || location.href;
+        const titleBase =
+            trimToLength(captionText, 40) ||
+            trimToLength(document.title, 40) ||
+            "instagram-media";
+
+        return {
+            title: trimToLength(`${titleBase}-${formatCurrentTimeToSecond()}`, 65),
+            tags: unique([authorName, ...hashtagTags, "instagram"]),
+            authorUrl: normalizeUrl(authorLink?.getAttribute("href") || permalink)
+        };
+    }
+
+    function extractMediaMeta(node) {
+        return isInstagramHost() ? extractInstagramMeta(node) : extractDouyinMeta(node);
+    }
+
     // ============================================================
     // Payload 组装 — 构造发送给 Eagle API 的数据
     // ============================================================
@@ -631,14 +795,14 @@
      */
     function buildPayload(frame, meta) {
         // 以下两个变量暂未使用，保留以供 Eagle 功能完善后启用
-        const metaDescription = document.querySelector('meta[name="description"]')?.content || "";
-        const metaKeywords = document.querySelector('meta[name="keywords"]')?.content || "";
+        // const metaDescription = document.querySelector('meta[name="description"]')?.content || "";
+        // const metaKeywords = document.querySelector('meta[name="keywords"]')?.content || "";
         return {
             title: meta.title,                                    // 素材标题
             url: meta.authorUrl,                                   // 来源 URL（作者主页）
             src: frame.dataUrl,                                   // 图片数据（base64 或 URL）
-            folderID: "抖音",                                     // 存入 Eagle 的文件夹名称
-            tags: unique([...(meta.tags || []), "抖音"]),         // 自动添加 "抖音" 标签
+            // folderID: "抖音",                                     // 存入 Eagle 的文件夹名称
+            // tags: unique([...(meta.tags || []), "抖音"]),         // 自动添加 "抖音" 标签
             // ============================================================
             // 🚧 以下参数暂时不需要，等 Eagle 端功能完善后再加回来
             // ============================================================
@@ -660,13 +824,13 @@
     function buildRequestBody(payload) {
         const params = new URLSearchParams();
 
-        params.set("version", SCRIPT_VERSION);       // 脚本版本
+        // params.set("version", SCRIPT_VERSION);       // 脚本版本
         params.set("type", "image");                 // 素材类型（固定为图片）
         params.set("title", trimToLength(payload.title, 65));  // 标题（Eagle 限制 65 字符）
         params.set("url", payload.url || "");         // 来源 URL
         params.set("src", payload.src || "");         // 图片数据源
-        params.set("folderID", payload.folderID || ""); // 目标文件夹
-        params.set("tags", payload.tags || "");       // 标签（数组转逗号分隔字符串）
+        // params.set("folderID", payload.folderID || ""); // 目标文件夹
+        // params.set("tags", payload.tags || "");       // 标签（数组转逗号分隔字符串）
 
         // ============================================================
         // 🚧 以下参数暂时不需要，等 Eagle 端功能完善后再加回来
@@ -735,7 +899,7 @@
         const media = findVisibleMediaElement();
 
         if (!media) {
-            throw new Error("No visible Douyin video frame or image found.");
+            throw new Error("No visible media found.");
         }
 
         // 步骤 2：根据媒体类型选择捕获方式
@@ -744,7 +908,7 @@
             : captureImageAsDataUrl(media);       // 图片 → Canvas 导出
 
         // 步骤 3：从 DOM 提取标题、标签、作者 URL
-        const meta = extractDouyinMeta(media);
+        const meta = extractMediaMeta(media);
 
         // 步骤 4：组装 Eagle 请求 payload
         const payload = buildPayload(frame, meta);
@@ -753,6 +917,100 @@
         await saveToEagle(payload);
         return payload;
     }
+
+
+    /**
+     * 自动裁剪 Canvas 边缘的黑边
+     * @param {HTMLCanvasElement} sourceCanvas - 源 Canvas 对象
+     * @param {number} threshold - 亮度阈值，默认 30
+     * @param {number} minPixelRate - 有效像素占比阈值，默认 0.05
+     * @returns {string} 返回裁剪后的 Base64 字符串
+     */
+    function autoCropImageFromCanvas(sourceCanvas, threshold = 30, minPixelRate = 0.1) {
+        const ctx = sourceCanvas.getContext('2d');
+        const w = sourceCanvas.width;
+        const h = sourceCanvas.height;
+
+        // 直接从传入的 Canvas 获取整张图像的像素数据
+        const imgData = ctx.getImageData(0, 0, w, h);
+        const data = imgData.data;
+
+        // 默认边界初始值
+        let top = 0, bottom = h - 1, left = 0, right = w - 1;
+
+        // 1. 从上往下扫描，找上边界
+        for (let y = 0; y < h; y++) {
+            let activePixels = 0;
+            for (let x = 0; x < w; x++) {
+                const idx = (y * w + x) * 4;
+                const brightness = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                if (brightness > threshold) activePixels++;
+            }
+            if (activePixels > w * minPixelRate) {
+                top = y;
+                break;
+            }
+        }
+
+        // 2. 从下往上扫描，找下边界
+        for (let y = h - 1; y >= 0; y--) {
+            let activePixels = 0;
+            for (let x = 0; x < w; x++) {
+                const idx = (y * w + x) * 4;
+                const brightness = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                if (brightness > threshold) activePixels++;
+            }
+            if (activePixels > w * minPixelRate) {
+                bottom = y;
+                break;
+            }
+        }
+
+        // 3. 从左往右扫描，找左边界
+        for (let x = 0; x < w; x++) {
+            let activePixels = 0;
+            for (let y = top; y <= bottom; y++) {
+                const idx = (y * w + x) * 4;
+                const brightness = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                if (brightness > threshold) activePixels++;
+            }
+            if (activePixels > (bottom - top) * minPixelRate) {
+                left = x;
+                break;
+            }
+        }
+
+        // 4. 从右往左扫描，找右边界
+        for (let x = w - 1; x >= 0; x--) {
+            let activePixels = 0;
+            for (let y = top; y <= bottom; y++) {
+                const idx = (y * w + x) * 4;
+                const brightness = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                if (brightness > threshold) activePixels++;
+            }
+            if (activePixels > (bottom - top) * minPixelRate) {
+                right = x;
+                break;
+            }
+        }
+
+        // 计算裁剪后的实际宽高
+        const cropWidth = right - left + 1;
+        const cropHeight = bottom - top + 1;
+
+        // 创建一个新的 Canvas 用于输出裁剪后的图像
+        const resultCanvas = document.createElement('canvas');
+        resultCanvas.width = cropWidth;
+        resultCanvas.height = cropHeight;
+        const resultCtx = resultCanvas.getContext('2d');
+
+        // 核心：直接把传入的源 Canvas 中确定的主体区域，绘制到新 Canvas 上
+        resultCtx.drawImage(sourceCanvas, left, top, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+
+        // 如果你需要直接拿到新 Canvas 对象，可以将下面这行改为：return resultCanvas;
+        return resultCanvas.toDataURL('image/png');
+    }
+
 
     /**
      * 入口函数：执行完整流程，将结果输出到控制台。
