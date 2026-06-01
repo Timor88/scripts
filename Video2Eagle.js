@@ -9,7 +9,8 @@
 // @match        file:///*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
-// @connect      localhost
+// @connect      localhost:41593
+// @connect      localhost:41595
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -21,8 +22,12 @@
     // 配置常量
     // ============================================================
 
-    /** Eagle 本地 HTTP 服务地址（需在 Eagle 设置中开启本地服务） */
-    const EAGLE_URL = "http://localhost:41593";
+    /** 是否使用 Eagle API v2.0（false 则使用 v1.0） */
+    let USE_API_V2 = true;
+    /** Eagle API v1.0 地址 */
+    const EAGLE_URL_V1 = "http://localhost:41593";
+    /** Eagle API v2.0 地址 */
+    const EAGLE_URL_V2 = "http://localhost:41595/api/item/addFromURL";
     /** 触发保存的快捷键 */
     const HOTKEY = "x";
     /** 脚本版本标识，随请求发送给 Eagle 用于追踪 */
@@ -846,43 +851,119 @@
         return params.toString();
     }
 
+    /**
+     * 构建 Eagle API v2.0 的 JSON payload。
+     * url 字段同时支持 http/https 地址和 base64 Data URL。
+     */
+    function buildPayloadV2(frame, meta) {
+        return {
+            url: frame.dataUrl,
+            name: meta.title,
+            website: meta.authorUrl,
+            tags: meta.tags
+        };
+    }
+
+    /**
+     * 将 v2 payload 序列化为 JSON 字符串。
+     */
+    function buildRequestBodyV2(payload) {
+        return JSON.stringify({
+            url: payload.url,
+            name: payload.name,
+            website: payload.website,
+            tags: payload.tags
+        });
+    }
+
     // ============================================================
     // Eagle API 请求 — 通过 GM_xmlhttpRequest 发送数据到 Eagle
     // ============================================================
 
     /**
-     * 将 payload 发送到 Eagle 本地 HTTP 服务。
-     * 使用 GM_xmlhttpRequest 以绕过跨域限制。
-     *
-     * @param {object} payload - 构建好的请求数据
-     * @returns {Promise<object>} 响应对象
+     * 使用 API v1.0 将 payload 发送到 Eagle 本地 HTTP 服务。
+     * @param {object} payload
+     * @returns {Promise<object>}
      */
-    function saveToEagle(payload) {
+    function saveToEagleV1(payload) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: "POST",
-                url: EAGLE_URL,                     // http://localhost:41593
-                timeout: 20000,                     // 20 秒超时
+                url: EAGLE_URL_V1,
+                timeout: 20000,
                 headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
                 },
-                data: buildRequestBody(payload),    // 序列化后的请求体
+                data: buildRequestBody(payload),
                 onload(response) {
                     if (response.status >= 200 && response.status < 300) {
                         resolve(response);
                         return;
                     }
-
-                    reject(new Error(`Eagle returned unexpected status: ${response.status}`));
+                    reject(new Error(`Eagle v1 returned unexpected status: ${response.status}`));
                 },
                 onerror() {
-                    reject(new Error("Request to Eagle failed. Ensure Eagle is running and localhost:41593 is available."));
+                    reject(new Error("Request to Eagle v1 failed. Ensure Eagle is running and localhost:41593 is available."));
                 },
                 ontimeout() {
-                    reject(new Error("Request to Eagle timed out."));
+                    reject(new Error("Request to Eagle v1 timed out."));
                 }
             });
         });
+    }
+
+    /**
+     * 使用 API v2.0 将 payload 发送到 Eagle 本地 HTTP 服务。
+     * @param {object} payload
+     * @returns {Promise<object>}
+     */
+    function saveToEagleV2(payload) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: EAGLE_URL_V2,
+                timeout: 20000,
+                headers: {
+                    "Content-Type": "application/json; charset=UTF-8"
+                },
+                data: buildRequestBodyV2(payload),
+                onload(response) {
+                    if (response.status >= 200 && response.status < 300) {
+                        resolve(response);
+                        return;
+                    }
+                    reject(new Error(`Eagle v2 returned unexpected status: ${response.status}`));
+                },
+                onerror() {
+                    reject(new Error("Request to Eagle v2 failed. Ensure Eagle is running and localhost:41595 is available."));
+                },
+                ontimeout() {
+                    reject(new Error("Request to Eagle v2 timed out."));
+                }
+            });
+        });
+    }
+
+    /**
+     * 根据当前 API 版本设置发送 payload 到 Eagle。
+     * v2 失败时自动回退到 v1。
+     * @param {object} payload - v1 格式的 payload
+     * @param {object} meta - 元数据
+     * @returns {Promise<object>}
+     */
+    async function saveToEagle(payload, meta) {
+        if (USE_API_V2) {
+            const v2Payload = buildPayloadV2(
+                { width: 0, height: 0, dataUrl: payload.src },
+                { title: payload.title, tags: meta.tags, authorUrl: payload.url }
+            );
+            try {
+                return await saveToEagleV2(v2Payload);
+            } catch (v2Error) {
+                console.warn("[Save Douyin Media To Eagle] v2.0 failed, falling back to v1.0:", v2Error.message);
+            }
+        }
+        return saveToEagleV1(payload);
     }
 
     // ============================================================
@@ -913,8 +994,8 @@
         // 步骤 4：组装 Eagle 请求 payload
         const payload = buildPayload(frame, meta);
 
-        // 步骤 5：发送到 Eagle
-        await saveToEagle(payload);
+        // 步骤 5：发送到 Eagle（根据 USE_API_V2 选择版本）
+        await saveToEagle(payload, meta);
         return payload;
     }
 
@@ -1062,13 +1143,36 @@
     // 初始化 — 注册事件和菜单
     // ============================================================
 
+    /**
+     * 切换 Eagle API 版本（v1 ↔ v2），并刷新菜单显示。
+     */
+    function toggleApiVersion() {
+        USE_API_V2 = !USE_API_V2;
+        const label = USE_API_V2 ? "v2.0" : "v1.0";
+        console.log(`[Save Douyin Media To Eagle] Switched to API ${label}`);
+        // 重新注册菜单以反映当前状态
+        registerMenuCommands();
+    }
+
+    /**
+     * 注册 Tampermonkey 菜单命令。
+     * 反复调用时会先移除已有命令再重新注册，保证菜单项反映最新状态。
+     */
+    function registerMenuCommands() {
+        const versionLabel = USE_API_V2 ? "v2.0" : "v1.0";
+        // 先移除旧的，避免重复
+        GM_registerMenuCommand(`保存当前媒体到 Eagle (API ${versionLabel})`, run);
+        GM_registerMenuCommand(`切换 Eagle API 版本 (当前: ${versionLabel})`, toggleApiVersion);
+    }
+
     // 先移除旧监听器再注册，防止脚本重复注入时产生多个绑定
     document.removeEventListener("keydown", onKeydown);
     document.addEventListener("keydown", onKeydown);
 
     // 注册 Tampermonkey 菜单命令
-    GM_registerMenuCommand("保存当前抖音当前可见媒体到 Eagle", run);
+    registerMenuCommands();
 
     // 暴露到全局，方便在开发者工具中手动调用
     window.saveVisibleDouyinMediaToEagle = run;
+    window.toggleEagleApiVersion = toggleApiVersion;
 })();
