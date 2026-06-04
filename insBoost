@@ -1,0 +1,158 @@
+// ==UserScript==
+// @name         Instagram 沉浸式导航 (滚轮+WASD) - 精准定位版
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  鼠标悬停滚轮切换图册；键盘 WASD控制滚动；附带精准定位偏移修正。
+// @author       You
+// @match        https://www.instagram.com/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=instagram.com
+// @grant        none
+// @license MIT
+// ==/UserScript==
+ 
+(function() {
+    'use strict';
+ 
+    // ==========================================
+    // ⚙️ 核心配置区 (你可以根据自己的屏幕随意修改)
+    // ==========================================
+    const EXTRA_Y_OFFSET = 40;    // ★ 关键修改：额外向下滚动的偏移量 (像素)。觉得滚得不够就调大，滚过了就调小。
+    const HEADER_OFFSET = 60;      // Instagram 顶部黑色导航栏的高度
+    const CAROUSEL_COOLDOWN = 300; // 鼠标滚轮/AD键的防抖冷却时间(毫秒)
+    const SCROLL_COOLDOWN = 500;   // WS 翻页滚动的防抖冷却时间(毫秒)
+ 
+    let isCarouselChanging = false;
+    let isPageScrolling = false;
+ 
+    // 多语言切换按钮的 ARIA 标签匹配
+    const NEXT_LABELS = ['下一步', '下一张', '下一張', '下一頁', 'Next', '次へ'];
+    const PREV_LABELS = ['上一步', '上一张', '上一張', '上一頁', '返回', 'Go back', 'Previous', '前へ'];
+    const nextSelector = NEXT_LABELS.map(label => `button[aria-label="${label}"]`).join(', ');
+    const prevSelector = PREV_LABELS.map(label => `button[aria-label="${label}"]`).join(', ');
+ 
+    // ==========================================
+    // 功能 1：鼠标滚轮控制图册切换
+    // ==========================================
+    window.addEventListener('wheel', function(event) {
+        const target = event.target;
+        const article = target.closest('article');
+        if (!article) return;
+ 
+        const isMediaArea = target.tagName === 'IMG' || target.tagName === 'VIDEO' ||
+                            target.closest('ul') || target.closest('._aagv');
+        if (!isMediaArea) return;
+ 
+        const nextBtn = article.querySelector(nextSelector);
+        const prevBtn = article.querySelector(prevSelector);
+ 
+        let btnToClick = null;
+        if (event.deltaY > 0) btnToClick = nextBtn;
+        else if (event.deltaY < 0) btnToClick = prevBtn;
+ 
+        if (btnToClick) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (isCarouselChanging) return;
+ 
+            btnToClick.click();
+            isCarouselChanging = true;
+            setTimeout(() => isCarouselChanging = false, CAROUSEL_COOLDOWN);
+        }
+    }, { passive: false });
+ 
+    // ==========================================
+    // 工具：获取当前视口中的活跃帖子
+    // ==========================================
+    function getActiveArticle() {
+        const articles = Array.from(document.querySelectorAll('article'));
+        if (articles.length === 0) return null;
+ 
+        // 寻找第一个底部超出我们预期视觉中心的帖子
+        const idealViewingTop = HEADER_OFFSET - EXTRA_Y_OFFSET;
+ 
+        for (let i = 0; i < articles.length; i++) {
+            const rect = articles[i].getBoundingClientRect();
+            // 如果这个帖子的底部还在屏幕的中下部，说明我们正在看它
+            if (rect.bottom > HEADER_OFFSET + 200) {
+                return { article: articles[i], index: i, all: articles };
+            }
+        }
+        return { article: articles[0], index: 0, all: articles };
+    }
+ 
+    // ==========================================
+    // 功能 2：键盘 WASD 控制
+    // ==========================================
+    window.addEventListener('keydown', function(event) {
+        // 【防误触】输入框中打字时，脚本不生效
+        const target = event.target;
+        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+            return;
+        }
+ 
+        const key = event.key.toLowerCase();
+        const isNextPost = key === 's' || key === 'arrowdown';
+        const isPrevPost = key === 'w' || key === 'arrowup';
+        const isNextImg  = key === 'd' || key === 'arrowright';
+        const isPrevImg  = key === 'a' || key === 'arrowleft';
+ 
+        if (!isNextPost && !isPrevPost && !isNextImg && !isPrevImg) return;
+ 
+        const activeData = getActiveArticle();
+        if (!activeData) return;
+        const { article, index, all } = activeData;
+ 
+        // --- A / D：切换图册 ---
+        if (isNextImg || isPrevImg) {
+            event.preventDefault();
+            if (isCarouselChanging) return;
+ 
+            let btnToClick = isNextImg ? article.querySelector(nextSelector) : article.querySelector(prevSelector);
+ 
+            if (btnToClick) {
+                btnToClick.click();
+                isCarouselChanging = true;
+                setTimeout(() => isCarouselChanging = false, CAROUSEL_COOLDOWN);
+            }
+        }
+ 
+        // --- W / S：页面上下翻帖子 ---
+        if (isNextPost || isPrevPost) {
+            event.preventDefault();
+            if (isPageScrolling) return;
+ 
+            let targetArticle = null;
+ 
+            // 我们的理想定位高度（帖子顶部在这个高度时，视觉是最舒服的）
+            const idealTop = HEADER_OFFSET - EXTRA_Y_OFFSET;
+ 
+            if (isNextPost) {
+                targetArticle = all[index + 1]; // 下一个帖子
+            } else if (isPrevPost) {
+                const currentTop = article.getBoundingClientRect().top;
+ 
+                // 如果当前位置已经滑过了理想位置（比如你在看评论），按 W 先回到当前帖子的理想位置
+                // 留出 50px 的容差，防止死循环卡顿
+                if (currentTop < idealTop - 50) {
+                    targetArticle = article;
+                } else {
+                    targetArticle = all[index - 1]; // 回到上一个帖子
+                }
+            }
+ 
+            if (targetArticle) {
+                const targetTop = targetArticle.getBoundingClientRect().top;
+ 
+                // 执行滚动：当前距顶部的距离 - 导航栏高度 + 我们想要的 400px 额外下滚量
+                window.scrollBy({
+                    top: targetTop - HEADER_OFFSET + EXTRA_Y_OFFSET,
+                    behavior: 'smooth'
+                });
+ 
+                isPageScrolling = true;
+                setTimeout(() => isPageScrolling = false, SCROLL_COOLDOWN);
+            }
+        }
+    }, { passive: false });
+ 
+})();
